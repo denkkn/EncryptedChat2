@@ -126,6 +126,12 @@ class CryptoManager(private val storage: FileStorage) {
     fun computeUid(b64: String) = MessageDigest.getInstance("SHA-256")
         .digest(b64.toByteArray(Charsets.US_ASCII)).joinToString("") { "%02x".format(it) }
 
+    // ---- compat methods for original code ----
+    fun hasPrivateKey() = hasKeyPair()
+    fun hasPublicKey() = hasKeyPair()
+    fun md5Hex(s: String) = MessageDigest.getInstance("MD5")
+        .digest(s.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+
     private fun loadPrivateKey() = KeyFactory.getInstance("RSA")
         .generatePrivate(PKCS8EncodedKeySpec(storage.readPrivatePemBytes()!!))
 

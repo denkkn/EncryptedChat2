@@ -51,7 +51,11 @@ class ChatRepository(
     suspend fun importPublicPem(pemText: String): Boolean = withContext(Dispatchers.IO) { crypto.importPublicPem(pemText) }
 
     suspend fun getPemBase64(): String? = withContext(Dispatchers.IO) { crypto.computePemBase64() }
-    suspend fun signNow(): Pair<String, String> = withContext(Dispatchers.IO) { crypto.signNow() }
+    suspend fun signNow(): Pair<String, String> = withContext(Dispatchers.IO) {
+        val ts = (System.currentTimeMillis() / 1000).toString()
+        val sig = crypto.signData(mapOf("ts" to ts.toLong(), "pub" to (crypto.computePemBase64() ?: "")))
+        ts to sig
+    }
 
     suspend fun readContacts(): Map<String, ContactConfig> = withContext(Dispatchers.IO) { storage.readContactsConfig() }
     suspend fun getContact(uid: String): ContactConfig? = withContext(Dispatchers.IO) { storage.readContactsConfig()[uid] }
