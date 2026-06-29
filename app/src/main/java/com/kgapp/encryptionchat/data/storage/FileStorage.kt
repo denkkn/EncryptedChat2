@@ -146,6 +146,15 @@ class FileStorage(private val context: Context) {
         return if (file.exists()) file.readBytes() else null
     }
 
+    fun hasPrivateKey() = privateKeyFile().exists()
+    fun hasPublicKey() = publicKeyFile().exists()
+    fun readPublicPemBytes(): ByteArray? {
+        val file = publicKeyFile()
+        return if (file.exists()) file.readBytes() else null
+    }
+    fun writePrivatePem(bytes: ByteArray) { ensureKeyDirs(); privateKeyFile().writeBytes(bytes) }
+    fun writePublicPem(bytes: ByteArray) { ensureKeyDirs(); publicKeyFile().writeBytes(bytes) }
+
     fun wipeSensitiveData() {
         privateKeyFile().delete()
         publicKeyFile().delete()

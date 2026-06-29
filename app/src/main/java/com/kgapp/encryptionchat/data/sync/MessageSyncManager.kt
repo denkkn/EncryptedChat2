@@ -40,27 +40,13 @@ class MessageSyncManager(
     suspend fun refreshOnce(fromUid: String): String? {
         val result = repository.readChat(fromUid)
         return when {
-            result.handshakeFailed -> {
-                repository.appendMessage(fromUid, Instant.now().epochSecond.toString(), 2, "握手密码错误")
+            !result.success -> result.message
+            result.addedCount > 0 -> {
                 _updates.tryEmit(fromUid)
-                "握手密码错误"
-            }
-            !result.success -> {
-                if (result.message == "无新消息") {
-                    null
-                } else {
-                    result.message
-                }
-            }
-            else -> {
-                if (result.addedCount > 0) {
-                    _updates.tryEmit(fromUid)
-                    if (activeChatUid != fromUid) {
-                        UnreadCounter.increment(context, fromUid)
-                    }
-                }
+                if (activeChatUid != fromUid) UnreadCounter.increment(context, fromUid)
                 null
             }
+            else -> null
         }
     }
 
@@ -125,12 +111,11 @@ class MessageSyncManager(
             currentFromUid = fromUid
             currentJob = scope.launch {
                 val lastTs = repository.getLastTimestamp(fromUid)
-                val payload = buildSsePayload(fromUid, lastTs)
-                if (payload.isEmpty()) {
-                    Log.d(TAG, "SSE skipped: missing credentials")
-                    return@launch
+                val pair = buildSsePayload(fromUid, lastTs) ?: run {
+                    Log.d(TAG, "SSE skipped: missing credentials"); return@launch
                 }
-                val call = sseApi.openStream(payload)
+                val (sig, data) = pair
+                val call = sseApi.openStream(sig, data)
                 currentCall = call
                 Log.d(TAG, "SSE start for $fromUid with lastTs=$lastTs")
                 try {
@@ -167,28 +152,18 @@ class MessageSyncManager(
         }
     }
 
-    private suspend fun buildSsePayload(fromUid: String, lastTs: Long): Map<String, String> {
-        val pemB64 = repository.getPemBase64() ?: return emptyMap()
-        val (ts, sig) = repository.signNow()
-        return mapOf(
-            "ts" to ts,
-            "sig" to sig,
-            "pub" to pemB64,
-            "type" to "2",
-            "from" to fromUid,
-            "last_ts" to lastTs.toString()
-        )
+    private suspend fun buildSsePayload(fromUid: String, lastTs: Long): Pair<String, org.json.JSONObject>? {
+        return repository.crypto?.buildSignedRequest("SseMsg", mapOf("from" to fromUid, "last_ts" to lastTs))
     }
 
     private suspend fun handleSseData(fromUid: String, payload: String) {
         val json = JSONObject(payload)
-        val text = json.optString("text", "")
-        val ts = json.optLong("ts", 0L)
-        if (text.isBlank() || ts <= 0L) return
-        val result = repository.handleIncomingCipherMessage(fromUid, ts, text)
-        if (result.handshakeFailed) {
-            repository.appendMessage(fromUid, Instant.now().epochSecond.toString(), 2, "握手密码错误")
-        }
+        if (json.optInt("code", -1) != 0) return
+        val encMsg = json.optString("msg", "")
+        val encKey = json.optString("key", "")
+        if (encMsg.isEmpty() || encKey.isEmpty()) return
+        val ts = java.time.Instant.now().epochSecond
+        val result = repository.handleIncomingCipherMessage(fromUid, ts, encMsg, encKey)
         if (result.success) {
             _updates.tryEmit(fromUid)
             if (activeChatUid != fromUid) {

@@ -16,7 +16,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 class ChatRepository(
     private val storage: FileStorage,
-    private val crypto: CryptoManager,
+    val crypto: CryptoManager,
     private val api: ChatApi
 ) {
     private val chatLocks = ConcurrentHashMap<String, Mutex>()
@@ -162,35 +162,24 @@ class ChatRepository(
         val config = storage.readContactsConfig()
         val contact = config[uid] ?: return@withContext SendResult(false, null, "联系人不存在", null)
 
-        val password = contact.pass
-        val textTo = "[pass=$password]$text"
-        val encrypted = crypto.encryptWithPublicPemBase64(contact.public, textTo)
-        if (encrypted.isBlank()) return@withContext SendResult(false, null, "加密失败", null)
+        // main..py 格式: AES-GCM 加密消息 + RSA-OAEP 加密密钥
+        val msgJson = org.json.JSONObject().apply {
+            put("type", "msg"); put("msg", text); put("time", System.currentTimeMillis() / 1000)
+        }
+        val (encMsg, encKey) = crypto.encryptForFriend(msgJson, contact.public)
 
-        val pemB64 = crypto.computePemBase64() ?: return@withContext SendResult(false, null, "本地公钥缺失", null)
-        val (ts, sig) = crypto.signNow()
+        val (sig, data) = crypto.buildSignedRequest("SendMsg", mapOf("recipient" to uid, "msg" to encMsg, "key" to encKey))
+            ?: return@withContext SendResult(false, null, "本地密钥缺失", null)
 
-        val payload = mapOf(
-            "ts" to ts,
-            "sig" to sig,
-            "pub" to pemB64,
-            "type" to "1",
-            "recipient" to uid,
-            "text" to encrypted
-        )
-
-        val respResult = api.postForm(payload)
+        val respResult = api.postJson(sig, data)
         val resp = when (respResult) {
             is ApiResult.Success -> respResult.value
             is ApiResult.Failure -> return@withContext SendResult(false, null, respResult.message, null)
         }
 
         val code = resp.optInt("code", -1)
-        if (code == 0 && resp.has("ts")) {
-            val serverTs = resp.optString("ts")
-            return@withContext SendResult(true, code, null, serverTs)
-        }
-        SendResult(false, code, "服务器返回错误", null)
+        if (code == 0) SendResult(true, code, null, (System.currentTimeMillis() / 1000).toString())
+        else SendResult(false, code, resp.optString("msg", "服务器返回错误"), null)
     }
 
     suspend fun readChat(uid: String): ReadResult = withContext(Dispatchers.IO) {
@@ -198,24 +187,13 @@ class ChatRepository(
             val config = storage.readContactsConfig()
             val contact = config[uid] ?: return@withChatLock ReadResult(false, null, "联系人不存在", 0, false)
 
-            val password = contact.pass
             val history = storage.readChatHistory(uid)
             val lastTs = history.keys.mapNotNull { it.toLongOrNull() }.maxOrNull() ?: 0L
 
-            val pemB64 = crypto.computePemBase64()
-                ?: return@withChatLock ReadResult(false, null, "本地公钥缺失", 0, false)
+            val (sig, data) = crypto.buildSignedRequest("GetMsg", mapOf("from" to uid, "last_ts" to lastTs))
+                ?: return@withChatLock ReadResult(false, null, "本地密钥缺失", 0, false)
 
-            val (ts, sig) = crypto.signNow()
-            val payload = mapOf(
-                "ts" to ts,
-                "sig" to sig,
-                "pub" to pemB64,
-                "type" to "0",
-                "from" to uid,
-                "last_ts" to lastTs.toString()
-            )
-
-            val respResult = api.postForm(payload)
+            val respResult = api.postJson(sig, data)
             val resp = when (respResult) {
                 is ApiResult.Success -> respResult.value
                 is ApiResult.Failure -> return@withChatLock ReadResult(false, null, respResult.message, 0, false)
@@ -223,26 +201,26 @@ class ChatRepository(
 
             val code = resp.optInt("code", -1)
             if (code == 0 && resp.has("data")) {
-                val data = resp.optJSONObject("data") ?: JSONObject()
+                val dataObj = resp.optJSONObject("data") ?: return@withChatLock ReadResult(false, code, "解析失败", 0, false)
                 var addedCount = 0
-                val keys = data.keys()
+                val keys = dataObj.keys().asSequence().toList().sorted()
                 val newHistory = history.toMutableMap()
 
-                while (keys.hasNext()) {
-                    val msgTs = keys.next()
-                    val item = data.optJSONObject(msgTs) ?: continue
-                    val cipherText = item.optString("text", "")
+                for (msgTs in keys) {
+                    val item = dataObj.optJSONObject(msgTs) ?: continue
+                    val encMsg = item.optString("msg", "")
+                    val encKey = item.optString("key", "")
+                    if (encMsg.isEmpty() || encKey.isEmpty()) continue
 
-                    val plain = crypto.decryptText(cipherText)
-                    val match = Regex("\\[pass=(.*?)\\]").find(plain)
-                    val pwd = match?.groupValues?.getOrNull(1) ?: ""
-                    val cleanText = plain.replaceFirst(Regex("\\[pass=.*?\\]"), "").trimStart()
-
-                    if (pwd != password) {
-                        return@withChatLock ReadResult(false, code, "握手密码错误", 0, true)
+                    val (json, _) = crypto.decryptReceived(encMsg, encKey)
+                    val type = json.optString("type", "msg")
+                    val text = when (type) {
+                        "msg" -> json.optString("msg", "")
+                        "file" -> "[${if (json.optBoolean("is_image")) "图片" else "文件"}] ${json.optString("filename", "")}"
+                        else -> json.optString("msg", json.optString("filename", ""))
                     }
 
-                    newHistory[msgTs] = ChatMessage(Spokesman = 1, text = cleanText)
+                    newHistory[msgTs] = ChatMessage(Spokesman = 1, text = text)
                     addedCount += 1
                 }
 
@@ -250,9 +228,10 @@ class ChatRepository(
                     storage.writeChatHistory(uid, newHistory)
                     return@withChatLock ReadResult(true, code, null, addedCount, false)
                 }
+                return@withChatLock ReadResult(true, code, "无新消息", 0, false)
             }
 
-            ReadResult(false, code, "无新消息", 0, false)
+            ReadResult(false, code, resp.optString("msg", "无新消息"), 0, false)
         }
     }
 
@@ -264,23 +243,18 @@ class ChatRepository(
     )
 
     // IMPORTANT: keep lock here to avoid concurrent file write (SSE receive + send/read).
-    suspend fun handleIncomingCipherMessage(uid: String, ts: Long, cipherText: String): IncomingResult =
+    suspend fun handleIncomingCipherMessage(uid: String, ts: Long, encMsg: String, encKey: String): IncomingResult =
         withContext(Dispatchers.IO) {
             withChatLock(uid) {
-                val config = storage.readContactsConfig()
-                val contact = config[uid] ?: return@withChatLock IncomingResult(false, "联系人不存在", false)
-
-                val password = contact.pass
-                val plain = crypto.decryptText(cipherText)
-
-                val match = Regex("\\[pass=(.*?)\\]").find(plain)
-                val pwd = match?.groupValues?.getOrNull(1) ?: ""
-                val cleanText = plain.replaceFirst(Regex("\\[pass=.*?\\]"), "").trimStart()
-
-                if (pwd != password) return@withChatLock IncomingResult(false, "握手密码错误", true)
-                if (ts <= 0L || cleanText.isBlank()) return@withChatLock IncomingResult(false, "消息格式异常", false)
-
-                storage.upsertChatMessage(uid, ts.toString(), ChatMessage(Spokesman = 1, text = cleanText))
+                val (json, _) = crypto.decryptReceived(encMsg, encKey)
+                val type = json.optString("type", "msg")
+                val text = when (type) {
+                    "msg" -> json.optString("msg", "")
+                    "file" -> "[${if (json.optBoolean("is_image")) "图片" else "文件"}] ${json.optString("filename", "")}"
+                    else -> json.optString("msg", json.optString("filename", ""))
+                }
+                if (ts <= 0L || text.isBlank()) return@withChatLock IncomingResult(false, "消息格式异常", false)
+                storage.upsertChatMessage(uid, ts.toString(), ChatMessage(Spokesman = 1, text = text))
                 IncomingResult(true, null, false)
             }
         }
