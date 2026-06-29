@@ -75,7 +75,7 @@ class ChatRepository(
 
     suspend fun addContact(remark: String, pubKey: String, password: String): String = withContext(Dispatchers.IO) {
         val pubB64 = java.util.Base64.getEncoder().encodeToString(pubKey.toByteArray(Charsets.UTF_8))
-        val uid = crypto.md5Hex(pubB64.toByteArray(Charsets.UTF_8))
+        val uid = crypto.md5Hex(pubB64)
         val config = storage.readContactsConfig()
         config[uid] = ContactConfig(Remark = remark, public = pubB64, pass = password)
         storage.writeContactsConfig(config)
